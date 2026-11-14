@@ -1,0 +1,6 @@
+#!/bin/sh
+# Mesh with OpenFOAM, then solve on the GPU.
+cd "${0%/*}" || exit 1
+set -e
+[ -d constant/polyMesh ] || ./Allmesh
+${SIMPLEFOAM_GPU:-simplefoam-gpu} . --every 250 2>&1 | tee log.simplefoam-gpu

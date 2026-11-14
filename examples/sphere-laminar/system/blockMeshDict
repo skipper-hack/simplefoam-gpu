@@ -1,0 +1,27 @@
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       dictionary;
+    object      blockMeshDict;
+}
+
+// 6 x 6 x 12 m box around a sphere of diameter 1 m at the origin; flow in -z.
+scale 1;
+
+vertices
+(
+    (-3 -3 -8) (3 -3 -8) (3 3 -8) (-3 3 -8)
+    (-3 -3  4) (3 -3  4) (3 3  4) (-3 3  4)
+);
+
+blocks (hex (0 1 2 3 4 5 6 7) (24 24 48) simpleGrading (1 1 1));
+
+edges ();
+
+boundary
+(
+    inlet    { type patch; faces ((4 5 6 7)); }
+    outlet   { type patch; faces ((0 3 2 1)); }
+    farfield { type patch; faces ((0 4 7 3) (1 2 6 5) (0 1 5 4) (3 7 6 2)); }
+);

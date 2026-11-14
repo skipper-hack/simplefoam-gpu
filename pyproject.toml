@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "simplefoam-gpu"
+version = "0.1.0"
+description = "GPU solver for OpenFOAM simpleFoam cases (steady incompressible, laminar or k-omega SST) that reproduces OpenFOAM's results"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.24", "scipy>=1.10"]
+keywords = ["CFD", "OpenFOAM", "GPU", "CUDA", "RANS", "simpleFoam"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Environment :: GPU :: NVIDIA CUDA",
+    "Topic :: Scientific/Engineering :: Physics",
+]
+
+[project.optional-dependencies]
+# CuPy is required; pick the wheel that matches your CUDA version (or install CuPy from conda-forge).
+cuda12 = ["cupy-cuda12x>=13"]
+cuda11 = ["cupy-cuda11x>=13"]
+
+[project.scripts]
+simplefoam-gpu = "simplefoam_gpu.simple:main"
+
+[tool.setuptools]
+packages = ["simplefoam_gpu"]

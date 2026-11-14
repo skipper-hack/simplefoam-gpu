@@ -1,0 +1,4 @@
+#!/bin/sh
+# Build the fix and its test with OpenFOAM's wmake (OpenFOAM environment must be sourced).
+cd "${0%/*}" || exit 1
+wmake libso transposeFix && wmake transposeTest

@@ -1,0 +1,12 @@
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       dictionary;
+    object      meshQualityDict;
+}
+
+#includeEtc "caseDicts/meshQualityDict"
+
+minVol          1e-16;
+minFaceWeight   0.02;

@@ -1,0 +1,15 @@
+__pycache__/
+*.egg-info/
+build/
+dist/
+.venv/
+# OpenFOAM build products
+openfoam-fix/**/Make/linux64*/
+openfoam-fix/**/lnInclude/
+# results of running the examples
+examples/*/0/
+examples/*/[1-9]*/
+examples/*/constant/polyMesh/
+examples/*/postProcessing/
+examples/*/log.*
+examples/*/processor*/

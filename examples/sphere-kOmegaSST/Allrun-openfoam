@@ -1,0 +1,12 @@
+#!/bin/sh
+# The same case with OpenFOAM's own simpleFoam on the CPU, for comparison.
+# Set TRANSPOSE_FIX=/path/to/libtransposeFix.so to preload the fix (see openfoam-fix/).
+cd "${0%/*}" || exit 1
+set -e
+[ -d constant/polyMesh ] || ./Allmesh
+if [ -n "$TRANSPOSE_FIX" ]; then
+    LD_PRELOAD="$TRANSPOSE_FIX" simpleFoam > log.simpleFoam 2>&1
+else
+    simpleFoam > log.simpleFoam 2>&1
+fi
+tail -1 postProcessing/forceCoeffs/0/coefficient.dat | awk '{print "Cd", $2}'

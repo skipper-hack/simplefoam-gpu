@@ -1,0 +1,12 @@
+#!/bin/sh
+# Mesh the case and set up the starting fields (needs OpenFOAM v2412 in the environment).
+cd "${0%/*}" || exit 1
+set -e
+rm -rf 0 constant/polyMesh
+blockMesh > log.blockMesh 2>&1
+snappyHexMesh -overwrite > log.snappyHexMesh 2>&1
+cp -r 0.orig 0
+potentialFoam -initialiseUBCs > log.potentialFoam 2>&1
+# Wall distance as OpenFOAM computes it (used by k-omega SST; the GPU solver computes it itself if missing)
+checkMesh -writeFields '(wallDistance)' > log.checkMesh 2>&1
+echo "mesh: $(grep -m1 'cells:' log.checkMesh | awk '{print $2}') cells"
