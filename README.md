@@ -76,17 +76,29 @@ stops with a list of anything it doesn't implement, instead of quietly solving a
 
 ## Requirements
 
-- An NVIDIA GPU with CUDA 11 or 12, and enough GPU memory: about 5 GB per million cells for k-omega SST
-- Python 3.10 or newer, with [CuPy](https://cupy.dev), NumPy and SciPy
+- An NVIDIA GPU and driver (CUDA 12 driver or newer), and enough GPU memory: about 5 GB per million cells for
+  k-omega SST
+- Python 3.10 or newer. The install below brings CuPy, NumPy, SciPy and the CUDA libraries it needs; you don't need
+  to install the CUDA toolkit yourself.
 - OpenFOAM (developed against v2412) to make the mesh and the starting fields. The solving itself doesn't use OpenFOAM.
 
 ## Install
 
+In a virtual environment (on Ubuntu, `python3 -m venv` needs the `python3-venv` package):
+
 ```bash
 git clone https://github.com/skipper-hack/simplefoam-gpu.git
 cd simplefoam-gpu
-pip install -e ".[cuda12]"     # or ".[cuda11]"; or install cupy from conda-forge and run: pip install -e .
+python3 -m venv .venv && . .venv/bin/activate
+pip install -e ".[cuda12]"
 ```
+
+This downloads about 3 GB, most of it CUDA libraries from NVIDIA. If you already have CuPy (for example from
+conda-forge), run `pip install -e .` instead. For an older CUDA 11 driver, use `".[cuda11]"` with a system CUDA 11
+toolkit.
+
+Check the install with `python -m unittest discover tests` (a few seconds). The first run compiles the GPU kernels,
+which takes a few seconds more; CuPy caches them after that.
 
 ## Quick start
 

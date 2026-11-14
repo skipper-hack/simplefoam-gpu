@@ -19,8 +19,9 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
-# CuPy is required; pick the wheel that matches your CUDA version (or install CuPy from conda-forge).
-cuda12 = ["cupy-cuda12x>=13"]
+# CuPy is required. cuda12 also installs the CUDA headers and compiler libraries through pip ([ctk]), so no
+# system CUDA toolkit is needed; cuda11 expects a system CUDA 11 toolkit. Or install CuPy from conda-forge.
+cuda12 = ["cupy-cuda12x[ctk]>=13"]
 cuda11 = ["cupy-cuda11x>=13"]
 
 [project.scripts]
