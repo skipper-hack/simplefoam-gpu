@@ -90,7 +90,7 @@ class Mesh:
         self.patches = []
         for p in g["patches"]:
             s = p["startFace"] - nif
-            self.patches.append(dict(name=p["name"], type=p["type"], sl=slice(s, s + p["nFaces"])))
+            self.patches.append(dict(name=p["name"], type=p["type"], groups=p["groups"], sl=slice(s, s + p["nFaces"])))
         own, nei = g["own"], g["nei"]
 
         def onehot(rows, ncols, sign=None):

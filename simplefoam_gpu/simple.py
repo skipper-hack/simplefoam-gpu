@@ -17,7 +17,7 @@ from .mesh import Mesh
 from .amg import AMG, bicgstab
 from . import kernels
 from . import fused
-from .check import check_case, UnsupportedCase
+from .check import check_case, function_objects, UnsupportedCase
 
 
 REFERENCE = os.environ.get("SIMPLEFOAM_GPU_REFERENCE") == "1"   # use the plain array code instead of fused kernels
@@ -34,7 +34,7 @@ class Solver:
     def __init__(self, case, start="0", log=print):
         self.case = Path(case)
         self.log = log
-        check_case(self.case)
+        check_case(self.case, start)
         t0 = time.time()
         self.m = m = Mesh(case)
         log(f"mesh: {m.nc} cells, {m.nf} faces, {m.nb} boundary faces  ({time.time() - t0:.1f}s)")
@@ -47,13 +47,14 @@ class Solver:
         self.n_nonorth = int(simple.get("nNonOrthogonalCorrectors", ["0"])[0])
         self.consistent = simple.get("consistent", ["no"])[0] in ("yes", "true", "on")
         self.nu = foamio.scalar(foamio.read_dict(self.case / "constant/transportProperties")["nu"][-1:])
-        self._read_forces()
+        tp = foamio.read_dict(self.case / "constant/turbulenceProperties")
+        rans = tp.get("simulationType", ["laminar"])[0] == "RAS"
+        self._read_forces(rans)
         self._read_fields(start)
         self.amg = None
         self.it = 0
         self.turb = None
-        tp = foamio.read_dict(self.case / "constant/turbulenceProperties")
-        if tp.get("simulationType", ["laminar"])[0] == "RAS":
+        if rans:
             model = tp["RAS"].get("RASModel", tp["RAS"].get("model", [""]))[0]
             if model != "kOmegaSST":
                 raise NotImplementedError(f"RAS model {model}")
@@ -66,26 +67,34 @@ class Solver:
             log(f"turbulence: kOmegaSST with wall functions ({time.time() - t0:.1f}s)")
 
     # ---- setup ------------------------------------------------------------------------------
-    def _read_forces(self):
+    def _read_forces(self, rans):
+        """Set up the forceCoeffs function object, and warn about every function object that will not run."""
         self.forces = None
-        fn = foamio.read_dict(self.case / "system/controlDict").get("functions", {})
-        for fname, d in fn.items():
-            if isinstance(d, dict) and d.get("type", [""])[0] == "forceCoeffs":
-                import re
-                pats = [p for p in foamio_flat(d["patches"])]
-                mask = cp.zeros(self.m.nb, bool)
-                for p in self.m.patches:
-                    if any(re.fullmatch(x, p["name"]) for x in pats):
-                        mask[p["sl"]] = True
-                drag = foamio.vector(d["dragDir"]); lift = foamio.vector(d["liftDir"])
-                pitch = foamio.vector(d["pitchAxis"])
-                self.forces = dict(mask=mask, rho=foamio.scalar(d["rhoInf"]), dragv=drag, liftv=lift, pitchv=pitch,
-                                   sidev=np.cross(lift, drag),
-                                   CofR=cp.asarray(foamio.vector(d["CofR"])) if "CofR" in d else cp.zeros(3),
-                                   drag=cp.asarray(drag), lift=cp.asarray(lift), pitch=cp.asarray(pitch),
-                                   side=cp.asarray(np.cross(lift, drag)),
-                                   Uinf=foamio.scalar(d["magUInf"]), Aref=foamio.scalar(d["Aref"]),
-                                   lRef=foamio.scalar(d["lRef"]), name=fname)
+        force, warnings = function_objects(self.case, rans)
+        for w in warnings:
+            self.log(f"warning: {w}")
+        if force is None:
+            return
+        fname, d = force
+        import re
+        try:
+            pats = [p for p in foamio_flat(d["patches"])]
+            mask = cp.zeros(self.m.nb, bool)
+            for p in self.m.patches:
+                if any(re.fullmatch(x, p["name"]) for x in pats):
+                    mask[p["sl"]] = True
+            drag = foamio.vector(d["dragDir"]); lift = foamio.vector(d["liftDir"])
+            pitch = foamio.vector(d["pitchAxis"])
+            self.forces = dict(mask=mask, rho=foamio.scalar(d["rhoInf"]), dragv=drag, liftv=lift, pitchv=pitch,
+                               sidev=np.cross(lift, drag),
+                               CofR=cp.asarray(foamio.vector(d["CofR"])) if "CofR" in d else cp.zeros(3),
+                               drag=cp.asarray(drag), lift=cp.asarray(lift), pitch=cp.asarray(pitch),
+                               side=cp.asarray(np.cross(lift, drag)),
+                               Uinf=foamio.scalar(d["magUInf"]), Aref=foamio.scalar(d["Aref"]),
+                               lRef=foamio.scalar(d["lRef"]), name=fname)
+        except (ValueError, TypeError, IndexError, re.error) as e:
+            self.forces = None
+            self.log(f"warning: forceCoeffs '{fname}' settings could not be read ({e}); it will not run")
 
     def _read_fields(self, start):
         m = self.m
@@ -102,7 +111,7 @@ class Solver:
         self.bc_text = {"U": [], "p": []}
         for pt in m.patches:
             sl, n = pt["sl"], pt["sl"].stop - pt["sl"].start
-            e = foamio.patch_entry(fU["boundary"], pt["name"]); t = e["type"][0]
+            e = foamio.patch_entry(fU["boundary"], pt["name"], pt["groups"]); t = e["type"][0]
             self.bc_text["U"].append(_entry_text(e))
             if t in ("fixedValue", "noSlip", "movingWallVelocity"):
                 self.vf_static[sl] = eye
@@ -119,7 +128,7 @@ class Solver:
                 self.Uref[sl] = cp.asarray(foamio.expand(e["inletValue"], n, 3))
             else:
                 raise NotImplementedError(f"U boundary type {t}")
-            e = foamio.patch_entry(fp["boundary"], pt["name"]); t = e["type"][0]
+            e = foamio.patch_entry(fp["boundary"], pt["name"], pt["groups"]); t = e["type"][0]
             self.bc_text["p"].append(_entry_text(e))
             if t == "fixedValue":
                 self.p_fixed[sl] = 1.0
@@ -132,7 +141,7 @@ class Solver:
             phi_i = foamio.expand(f["internal"], m.nif, 1)
             phi_b = np.zeros(nb)
             for pt in m.patches:
-                e = foamio.patch_entry(f["boundary"], pt["name"])
+                e = foamio.patch_entry(f["boundary"], pt["name"], pt["groups"])
                 if "value" in e:
                     phi_b[pt["sl"]] = foamio.expand(e["value"], pt["sl"].stop - pt["sl"].start, 1)
             self.phi = cp.asarray(np.concatenate([phi_i, phi_b]))
@@ -489,7 +498,10 @@ def main():
     ap.add_argument("--no-output", action="store_true", help="no time directories or postProcessing files")
     a = ap.parse_args()
     case = Path(a.case)
-    cd = foamio.read_dict(case / "system/controlDict")
+    try:
+        cd = foamio.read_dict(case / "system/controlDict")
+    except foamio.FoamSyntaxError as e:
+        raise SystemExit(f"simplefoam-gpu: {e}")
     start = a.start
     if start is None:
         start = cd.get("startTime", ["0"])[0] if cd.get("startFrom", ["startTime"])[0] == "startTime" else "latestTime"
@@ -502,7 +514,7 @@ def main():
     write_every = int(cd.get("writeInterval", ["0"])[0]) if cd.get("writeControl", ["timeStep"])[0] == "timeStep" else 0
     try:
         s = Solver(case, start)
-    except UnsupportedCase as e:
+    except (UnsupportedCase, foamio.FoamSyntaxError) as e:
         raise SystemExit(f"simplefoam-gpu: {e}")
     out_w = None if (a.no_output or a.write) else Outputs(s, _time_name(t_start))
     print(f"start time {start}, {n_iter} iterations, writing every {write_every}", flush=True)

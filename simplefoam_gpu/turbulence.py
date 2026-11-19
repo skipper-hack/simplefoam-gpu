@@ -35,7 +35,7 @@ class ScalarBC:
         self.text = []
         for pt in m.patches:
             sl, n = pt["sl"], pt["sl"].stop - pt["sl"].start
-            e = foamio.patch_entry(field["boundary"], pt["name"])
+            e = foamio.patch_entry(field["boundary"], pt["name"], pt["groups"])
             t = e["type"][0]
             self.text.append(t)
             if t == "fixedValue":
@@ -48,7 +48,7 @@ class ScalarBC:
                 pass
             else:
                 raise NotImplementedError(f"{name} boundary type {t}")
-        self.entries = [_entry_text(foamio.patch_entry(field["boundary"], pt["name"])) for pt in m.patches]
+        self.entries = [_entry_text(foamio.patch_entry(field["boundary"], pt["name"], pt["groups"])) for pt in m.patches]
 
     def is_fixed(self, phi_b):
         return self.fixed | self.wf | (self.io & (phi_b < 0))
@@ -95,7 +95,7 @@ class KOmegaSST:
         self.spalding = cp.zeros(m.nb, bool)
         self.nut_text = []
         for pt in m.patches:
-            e = foamio.patch_entry(fn["boundary"], pt["name"])
+            e = foamio.patch_entry(fn["boundary"], pt["name"], pt["groups"])
             t = e["type"][0]
             self.nut_text.append(_entry_text(e))
             if t == "nutUSpaldingWallFunction":
@@ -129,7 +129,7 @@ class KOmegaSST:
         m = self.s.m
         out = cp.zeros(m.nb)
         for pt in m.patches:
-            e = foamio.patch_entry(f["boundary"], pt["name"])
+            e = foamio.patch_entry(f["boundary"], pt["name"], pt["groups"])
             if "value" in e:
                 out[pt["sl"]] = cp.asarray(foamio.expand(e["value"], pt["sl"].stop - pt["sl"].start, ncomp))
         return out
