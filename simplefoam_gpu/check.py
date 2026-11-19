@@ -131,6 +131,10 @@ def _check(case, start, problems):
             got = _lookup(sch, sec, "default")
         if got != val:
             problems.append(f"fvSchemes {sec} {key} is '{got}'; the solver implements '{val}'")
+    if not (case / "constant/polyMesh/boundary").is_file():
+        problems.append("constant/polyMesh/boundary is missing: mesh the case first "
+                        "(patch types and boundary conditions were not checked)")
+        return
     patches = foamio.read_boundary(case / "constant/polyMesh/boundary")
     for p in patches:
         if p["type"] not in SUPPORTED_PATCHES:
@@ -259,3 +263,67 @@ def _has_entries(path):
                    for v in foamio.read_dict(path).values())
     except Exception:
         return True
+
+
+# ---- simplefoam-gpu-check -----------------------------------------------------------------------
+def _default_start(case):
+    """The time folder simplefoam-gpu would start from (as its main() chooses it), or 0.orig before Allrun."""
+    try:
+        cd = foamio.read_dict(case / "system/controlDict")
+    except foamio.FoamSyntaxError:
+        return None   # check_case reports it
+    start = cd.get("startTime", ["0"])[0] if cd.get("startFrom", ["startTime"])[0] == "startTime" else "latestTime"
+    if start == "latestTime":
+        times = [d.name for d in case.iterdir() if d.is_dir() and _is_number(d.name) and (d / "U").exists()]
+        start = max(times, key=float) if times else "0"
+    if not (case / start).is_dir() and (case / "0.orig").is_dir():
+        start = "0.orig"
+    return start
+
+
+def _is_number(x):
+    try:
+        float(x)
+        return True
+    except ValueError:
+        return False
+
+
+def main(argv=None):
+    """Say whether simplefoam-gpu can run a case. Needs only NumPy: no GPU, nothing is solved or written."""
+    import argparse
+    ap = argparse.ArgumentParser(
+        prog="simplefoam-gpu-check",
+        description="Check whether simplefoam-gpu can run an OpenFOAM case. Needs no GPU; nothing is solved or "
+                    "written. Exit status 0: it can run; 1: it lists what is not supported.")
+    ap.add_argument("case", nargs="?", default=".", help="case folder (default: current folder)")
+    ap.add_argument("--start", default=None,
+                    help="time folder whose fields are checked (default: as the solver chooses it, else 0.orig)")
+    a = ap.parse_args(argv)
+    case = Path(a.case)
+    if not (case / "system/controlDict").is_file():
+        print(f"simplefoam-gpu-check: {case} is not an OpenFOAM case (no system/controlDict)")
+        return 2
+    start = a.start or _default_start(case)
+    print(f"Case {case.resolve()}" + (f", fields from {start}/" if start else ""))
+    try:
+        check_case(case, start)
+        ok = True
+    except UnsupportedCase as e:
+        ok = False
+        msg = str(e)
+        print("\n" + msg[:1].upper() + msg[1:])
+    try:
+        tp = foamio.read_dict(case / "constant/turbulenceProperties")
+        _, warnings = function_objects(case, tp.get("simulationType", ["laminar"])[0] == "RAS")
+    except (OSError, foamio.FoamSyntaxError):
+        warnings = []   # reported above
+    if warnings:
+        print("\nFunction objects in controlDict that simplefoam-gpu will not run:\n  - " + "\n  - ".join(warnings))
+    if ok:
+        print("\nsimplefoam-gpu can run this case.")
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

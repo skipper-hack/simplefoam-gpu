@@ -26,6 +26,7 @@ cuda11 = ["cupy-cuda11x>=13"]
 
 [project.scripts]
 simplefoam-gpu = "simplefoam_gpu.simple:main"
+simplefoam-gpu-check = "simplefoam_gpu.check:main"
 
 [tool.setuptools]
 packages = ["simplefoam_gpu"]

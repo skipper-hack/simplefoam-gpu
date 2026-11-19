@@ -1,10 +1,13 @@
 """The case check accepts the examples and refuses settings the solver does not implement (CPU only)."""
+import io
 import os
 import shutil
+from contextlib import redirect_stdout
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
+from simplefoam_gpu import check
 from simplefoam_gpu.check import check_case, function_objects, UnsupportedCase
 
 EXAMPLES = Path(__file__).resolve().parent.parent / "examples"
@@ -153,6 +156,42 @@ boundaryField
         self.assertIn("surfaces.cfg", text)
         self.assertNotIn("'off'", text)
         self.assertEqual(len(warnings), 3)
+
+    def run_check_command(self, *args):
+        out = io.StringIO()
+        with redirect_stdout(out), mock.patch.dict(os.environ, NO_ETC):
+            status = check.main([str(a) for a in args])
+        return status, out.getvalue()
+
+    def test_check_command(self):
+        status, out = self.run_check_command(self.case_with_fields("sphere-laminar"))
+        self.assertEqual(status, 0)
+        self.assertIn("fields from 0/", out)
+        self.assertIn("simplefoam-gpu can run this case.", out)
+
+        c = self.case_with_fields("sphere-kOmegaSST")
+        self.edit(c / "0/nut", "sphere   { type nutUSpaldingWallFunction;", "sphere   { type nutkWallFunction;")
+        self.edit(c / "system/controlDict", "    yPlus\n", "    streamLines { type streamLine; }\n    yPlus\n")
+        status, out = self.run_check_command(c)
+        self.assertEqual(status, 1)
+        self.assertIn("0/nut uses boundary type nutkWallFunction on patch sphere", out)
+        self.assertIn("'streamLines' (type streamLine) is not supported", out)
+        self.assertNotIn("can run this case", out)
+
+    def test_check_command_before_allrun(self):
+        """With no time folder yet, the fields in 0.orig are checked; without a mesh, it says so."""
+        c = self.case("sphere-laminar")
+        shutil.copytree(EXAMPLES / "sphere-laminar/0.orig", c / "0.orig")
+        (c / "constant/polyMesh/boundary").write_text(BOUNDARY_FULL)
+        status, out = self.run_check_command(c)
+        self.assertEqual(status, 0, out)
+        self.assertIn("fields from 0.orig/", out)
+        (c / "constant/polyMesh/boundary").unlink()
+        status, out = self.run_check_command(c)
+        self.assertEqual(status, 1)
+        self.assertIn("mesh the case first", out)
+        status, out = self.run_check_command(c / "system")
+        self.assertEqual(status, 2)
 
 
 if __name__ == "__main__":

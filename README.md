@@ -113,6 +113,22 @@ cd examples/sphere-kOmegaSST
 `checkMesh -writeFields '(wallDistance)'`), then `simplefoam-gpu`. `Allrun-openfoam` solves the same case with
 OpenFOAM's `simpleFoam` for comparison, and `Allclean` removes the results.
 
+## Check a case first (no GPU needed)
+
+`simplefoam-gpu-check` says whether simplefoam-gpu can run a case and, if not, lists every setting it doesn't
+support. It needs only NumPy, so it runs on any computer, and it doesn't solve or write anything:
+
+```bash
+git clone https://github.com/skipper-hack/simplefoam-gpu.git
+pip install ./simplefoam-gpu                   # NumPy and SciPy only, no CuPy or CUDA
+simplefoam-gpu-check path/to/case
+```
+
+It checks `controlDict`, `fvSchemes`, the turbulence and transport settings, the patch types and the boundary
+conditions of the start-time fields (or `0.orig`), following `#include` and `$macros` as OpenFOAM does, and names the
+`controlDict` function objects that won't run. From the mesh it only needs `constant/polyMesh/boundary`. The exit
+status is 0 when the case can run and 1 when it can't.
+
 ## Use on your own case
 
 Set the case up as you would for `simpleFoam` (supported settings above), then, inside the case folder:
@@ -150,7 +166,10 @@ Environment variables: `SIMPLEFOAM_GPU_PROFILE=1` prints the time spent in each 
 - **Pressure:** the pressure equation is solved with conjugate gradients preconditioned by aggregation multigrid.
   The coarse levels are built once and re-summed on the GPU every iteration.
 - **Other equations:** U, k and omega use Jacobi-preconditioned BiCGStab. The linear solvers are not OpenFOAM's
-  (GAMG, smoothSolver), but they converge to the same tolerances, so the converged answer is the same.
+  (GAMG, smoothSolver), and their stopping tolerances are fixed in the code (absolute 1e-8, relative 0.05, the values
+  in the examples' `fvSolution`); the `solvers` settings in `fvSolution` are not read yet. Once SIMPLE has converged,
+  the answer does not depend on the linear solver, so it is the same as OpenFOAM's; the iterations on the way there
+  can differ slightly.
 - **Exact reductions:** min/max reductions use exact 64-bit atomics, so limiters match OpenFOAM bit for bit.
 
 ## An OpenFOAM bug found on the way
