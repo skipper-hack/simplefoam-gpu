@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: MIT
-"""k-omega SST (OpenFOAM v2412 kOmegaSSTBase) with kqRWallFunction, omegaWallFunction (binomial2 blending) and
-nutUSpaldingWallFunction, on the GPU.
+"""k-omega SST (OpenFOAM v2412 kOmegaSSTBase) with kqRWallFunction, omegaWallFunction (binomial2 blending),
+nutUSpaldingWallFunction and nutkWallFunction (stepwise blending), on the GPU.
 
 Mirrors kOmegaSSTBase::correct() step by step; comments name the OpenFOAM pieces. Schemes as in the supported
 fvSchemes: div(phi,k|omega) bounded Gauss upwind, laplacian Gauss linear corrected, grad default Gauss linear,
 grad(U) cellLimited Gauss linear 1 (supplied by the caller).
 """
+import math
 from pathlib import Path
 import numpy as np
 import cupy as cp
@@ -15,6 +16,9 @@ from .amg import bicgstab
 from . import kernels
 
 SMALL = 1e-15
+# Scalar boundary types that act as zeroGradient: for scalars, OpenFOAM's slip, symmetry and symmetryPlane fields
+# take the cell value and have zero normal gradient (basicSymmetryFvPatchField<scalar>, transformFvPatchField<scalar>)
+ZERO_GRADIENT_SCALAR = ("zeroGradient", "slip", "symmetry", "symmetryPlane")
 
 
 from .kernels import tick as _tick
@@ -44,7 +48,7 @@ class ScalarBC:
                 self.io[sl] = True; self.ref[sl] = cp.asarray(foamio.expand(e["inletValue"], n, 1))
             elif t == "omegaWallFunction":
                 self.wf[sl] = True; self.ref[sl] = cp.asarray(foamio.expand(e["value"], n, 1))
-            elif t in ("zeroGradient", "kqRWallFunction"):
+            elif t in ZERO_GRADIENT_SCALAR or t == "kqRWallFunction":
                 pass
             else:
                 raise NotImplementedError(f"{name} boundary type {t}")
@@ -72,6 +76,10 @@ class KOmegaSST:
     a1, b1, c1 = 0.31, 1.0, 10.0
     Cmu, kappa, E = 0.09, 0.41, 9.8
     omega_beta1 = 0.075   # omegaWallFunction beta1
+    # wallFunctionCoefficients::calcYPlusLam: 10 fixed-point iterations from 11 (11.53 for kappa 0.41, E 9.8)
+    yPlusLam = 11.0
+    for _ in range(10):
+        yPlusLam = math.log(max(E * yPlusLam, 1.0)) / kappa
 
     def __init__(self, solver, start, relax_k, relax_omega, log=print):
         self.s = s = solver
@@ -92,7 +100,9 @@ class KOmegaSST:
         self.kb = self.bk.values(self.k, m.bcell, phi_b)      # evaluated as OpenFOAM does on read
         self.ob = self.bo.values(self.omega, m.bcell, phi_b)
         self.nutb = self._file_boundary(fn, 1)
-        self.spalding = cp.zeros(m.nb, bool)
+        self.spalding = cp.zeros(m.nb, bool)     # nutUSpaldingWallFunction
+        self.nutk = cp.zeros(m.nb, bool)         # nutkWallFunction
+        self.nut_zg = cp.zeros(m.nb, bool)       # slip, symmetry, symmetryPlane: the cell value
         self.nut_text = []
         for pt in m.patches:
             e = foamio.patch_entry(fn["boundary"], pt["name"], pt["groups"])
@@ -100,8 +110,13 @@ class KOmegaSST:
             self.nut_text.append(_entry_text(e))
             if t == "nutUSpaldingWallFunction":
                 self.spalding[pt["sl"]] = True
+            elif t == "nutkWallFunction":
+                self.nutk[pt["sl"]] = True
+            elif t in ZERO_GRADIENT_SCALAR[1:]:
+                self.nut_zg[pt["sl"]] = True
             elif t != "calculated":
                 raise NotImplementedError(f"nut boundary type {t}")
+        self.has_nutk = bool(self.nutk.any())
         # wall distances
         raw, geom = m.raw, m.cpu
         y_cell, self.y_wall, self.wall = walldist.compute(raw, geom)
@@ -159,26 +174,47 @@ class KOmegaSST:
         gb = gc + m.nb_hat * (sn - (m.nb_hat * gc).sum(1))[:, None]
         return g, gb
 
+    def _mag_up(self, U):
+        """|U_cell - U_wall| on boundary faces, as the wall functions use it (a moving wall has fixedValue U)."""
+        m = self.s.m
+        Ub = self.s.bc_U(U, self.s.phi[m.nif:])[0]
+        return cp.linalg.norm(U[m.bcell] - Ub, axis=1)
+
     def spalding_nut(self, U, nuw):
-        """nutUSpaldingWallFunction::calcNut on Spalding faces (noSlip walls)."""
+        """nutUSpaldingWallFunction::calcNut on Spalding faces."""
         uTau, magGradU = self._spalding_utau(U, nuw)
         return cp.maximum(0.0, uTau * uTau / (magGradU + ROOTVSMALL) - nuw)
 
+    def _yplus_k(self, nuw):
+        """Cmu^0.25 y sqrt(k_cell)/nu on boundary faces (the y+ of nutkWallFunction)."""
+        m = self.s.m
+        return self.Cmu ** 0.25 * cp.where(self.nutk, self.y_wall, 1.0) * cp.sqrt(self.k[m.bcell]) / nuw
+
+    def nutk_nut(self, nuw):
+        """nutkWallFunction::calcNut, stepwise blending: the log-law nut where y+ > yPlusLam, else zero."""
+        yp = self._yplus_k(nuw)
+        nutLog = nuw * yp * self.kappa / cp.log(cp.maximum(self.E * yp, 1 + 1e-4))
+        return cp.where(yp > self.yPlusLam, nutLog, nuw) - nuw
+
     def yplus(self, U):
-        """y+ on wall faces as the yPlus function object reports it (Spalding patches: y*uTau/nu)."""
+        """y+ on wall faces as the yPlus function object reports it (Spalding patches: y*uTau/nu; nutkWallFunction:
+        Cmu^0.25 y sqrt(k)/nu, or y sqrt(nuEff |snGrad U|)/nu below yPlusLam)."""
         m = self.s.m
         nu = self.s.nu
         uTau, magGradU = self._spalding_utau(U, nu)
-        other = self.wall & ~self.spalding
         ut_other = cp.sqrt((self.nutb + nu) * magGradU)
-        return cp.where(self.spalding, self.y_wall * uTau / nu, cp.where(other, self.y_wall * ut_other / nu, 0.0))
+        y_other = self.y_wall * ut_other / nu
+        yk = self._yplus_k(nu)
+        yk = cp.where(yk < self.yPlusLam, y_other, yk)
+        other = self.wall & ~self.spalding & ~self.nutk
+        return cp.where(self.spalding, self.y_wall * uTau / nu,
+                        cp.where(self.nutk, yk, cp.where(other, y_other, 0.0)))
 
     def _spalding_utau(self, U, nuw):
         """nutUSpaldingWallFunction::calcUTau (Newton, maxIter 10, tolerance 0.01) from the current wall nut."""
         m = self.s.m
         sl = self.spalding
-        Uc = U[m.bcell]
-        magUp = cp.linalg.norm(Uc, axis=1)                  # |U_cell - U_wall|, U_wall = 0
+        magUp = self._mag_up(U)                             # |U_cell - U_wall|
         magGradU = magUp * m.dcb                            # |snGrad(U_wall)|
         from . import fused
         uTau = fused.spalding_utau(magUp, magGradU, cp.where(sl, self.y_wall, 1.0), self.nutb, nuw, sl,
@@ -186,15 +222,18 @@ class KOmegaSST:
         return uTau, magGradU
 
     def correct_nut(self, S2, S2b, U):
-        """kOmegaSSTBase::correctNut(S2) incl. boundary values, then the wall function on Spalding patches."""
+        """kOmegaSSTBase::correctNut(S2) incl. boundary values, then the nut boundary conditions: wall functions,
+        and the cell value on slip/symmetry patches."""
         s = self.s
         F23 = self._F23(self.k, self.omega, self.y)
         self.nut = self.a1 * self.k / cp.maximum(self.a1 * self.omega, self.b1 * F23 * cp.sqrt(S2))
         yb = self.y[s.m.bcell]
         F23b = self._F23(self.kb, self.ob, yb)
         nutb = self.a1 * self.kb / cp.maximum(self.a1 * self.ob, self.b1 * F23b * cp.sqrt(S2b))
-        nutw = self.spalding_nut(U, s.nu)
-        self.nutb = cp.where(self.spalding, nutw, nutb)
+        nutb = cp.where(self.nut_zg, self.nut[s.m.bcell], nutb)
+        if self.has_nutk:
+            nutb = cp.where(self.nutk, self.nutk_nut(s.nu), nutb)
+        self.nutb = cp.where(self.spalding, self.spalding_nut(U, s.nu), nutb)
 
     def validate(self, U, g, gb):
         S2, S2b = _S2(g), _S2(gb)
@@ -290,7 +329,7 @@ class KOmegaSST:
         omegaLog = cp.sqrt(kc) / (Cmu25 * self.kappa * y)
         w = self.wf_w[f]
         om0 = cp.zeros(m.nc); kernels_add(om0, cells, w * cp.sqrt(omegaVis ** 2 + omegaLog ** 2))
-        magGradUw = cp.linalg.norm(U[cells], axis=1) * m.dcb[f]
+        magGradUw = self._mag_up(U)[f] * m.dcb[f]
         G0 = cp.zeros(m.nc)
         kernels_add(G0, cells, w * (self.nutb[f] + nuw) * magGradUw * Cmu25 * cp.sqrt(kc) / (self.kappa * y))
         wc = self.wf_cells

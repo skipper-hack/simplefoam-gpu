@@ -61,10 +61,14 @@ meshes don't fill a GPU, so the speed-up grows with mesh size.
   - `div(phi,k)`, `div(phi,omega)` `bounded Gauss upwind`; other gradients `Gauss linear`
   - laplacians `Gauss linear corrected`; `div((nuEff*dev2(T(grad(U)))))` `Gauss linear`
 - **Boundary conditions:**
-  - U: `fixedValue`, `noSlip`, `slip`, `symmetry`, `zeroGradient`, `pressureInletOutletVelocity`, `inletOutlet`
-  - p: `fixedValue`, `zeroGradient`
-  - k, omega: `fixedValue`, `inletOutlet`, `zeroGradient`, `kqRWallFunction`, `omegaWallFunction`
-  - nut: `calculated`, `nutUSpaldingWallFunction`
+  - U: `fixedValue` (also on moving walls), `noSlip`, `slip`, `symmetry`, `symmetryPlane`, `zeroGradient`,
+    `pressureInletOutletVelocity`, `inletOutlet`
+  - p: `fixedValue`, `zeroGradient`, `slip`, `symmetry`, `symmetryPlane`
+  - k, omega: `fixedValue`, `inletOutlet`, `zeroGradient`, `slip`, `symmetry`, `symmetryPlane`, `kqRWallFunction`,
+    `omegaWallFunction`
+  - nut: `calculated`, `nutkWallFunction`, `nutUSpaldingWallFunction`, `slip`, `symmetry`, `symmetryPlane`
+  - Wall functions with OpenFOAM's default settings (`Cmu 0.09`, `kappa 0.41`, `E 9.8`; `nutkWallFunction`
+    blending `stepwise`, `omegaWallFunction` blending `binomial` with `n 2`)
 - **Patch types:** `patch`, `wall`, `symmetry`, `symmetryPlane`
 - **Output:** time folders (`U p phi`, plus `k omega nut yPlus` for k-omega SST), `forceCoeffs` (all 12 columns),
   y+ on walls. It follows `controlDict`: `startFrom`, `endTime`, `writeInterval`, `purgeWrite`, and

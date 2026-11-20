@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 from simplefoam_gpu import check
-from simplefoam_gpu.check import check_case, function_objects, UnsupportedCase
+from simplefoam_gpu.check import check_case, force_patches, function_objects, UnsupportedCase
 
 EXAMPLES = Path(__file__).resolve().parent.parent / "examples"
 BOUNDARY = """FoamFile { version 2.0; format ascii; class polyBoundaryMesh; object boundary; }
@@ -75,16 +75,49 @@ class Check(unittest.TestCase):
     def test_unsupported_boundary_conditions_listed(self):
         """Unsupported field boundary types are reported together, before anything is set up."""
         c = self.case_with_fields("sphere-kOmegaSST")
-        self.edit(c / "0/nut", "sphere   { type nutUSpaldingWallFunction;", "sphere   { type nutkWallFunction;")
+        self.edit(c / "0/nut", "sphere   { type nutUSpaldingWallFunction;", "sphere   { type nutkRoughWallFunction;")
         self.edit(c / "0/p", "outlet   { type fixedValue; value uniform 0; }",
                   "outlet   { type fixedFluxPressure; value uniform 0; }")
         self.edit(c / "0/U", "inlet    { type fixedValue; value uniform (0 0 -20); }", "inlet    { type fixedValue; }")
         with self.assertRaises(UnsupportedCase) as e:
             check_case(c, "0")
         msg = str(e.exception)
-        self.assertIn("0/nut uses boundary type nutkWallFunction on patch sphere", msg)
+        self.assertIn("0/nut uses boundary type nutkRoughWallFunction on patch sphere", msg)
         self.assertIn("0/p uses boundary type fixedFluxPressure on patch outlet", msg)
         self.assertIn("0/U patch inlet (fixedValue) has no value", msg)
+
+    def test_scalar_slip_and_symmetry_accepted(self):
+        """For scalars, slip, symmetry and symmetryPlane act as zeroGradient (the motorBike tutorial uses slip)."""
+        c = self.case_with_fields("sphere-kOmegaSST")
+        for name in ("p", "k", "omega", "nut"):
+            txt = (c / "0" / name).read_text()
+            start = txt.index("farfield")
+            end = txt.index("}", start) + 1
+            (c / "0" / name).write_text(txt[:start] + "farfield { type slip; }" + txt[end:])
+        check_case(c, "0")
+        self.edit(c / "0/nut", "sphere   { type nutUSpaldingWallFunction;", "sphere   { type nutkWallFunction;")
+        check_case(c, "0")
+
+    def test_wall_function_settings(self):
+        """Wall functions run with OpenFOAM's default coefficients and blending; other settings are refused."""
+        c = self.case_with_fields("sphere-kOmegaSST")
+        self.edit(c / "0/nut", "sphere   { type nutUSpaldingWallFunction;",
+                  "sphere   { type nutkWallFunction; blending stepwise; Cmu 0.09; kappa 0.41; E 9.8;")
+        txt = (c / "0/omega").read_text()
+        self.assertIn("omegaWallFunction;", txt)
+        (c / "0/omega").write_text(txt.replace("omegaWallFunction;", "omegaWallFunction; blending binomial; n 2;"))
+        check_case(c, "0")
+        self.edit(c / "0/nut", "blending stepwise; Cmu 0.09; kappa 0.41;", "blending binomial; Cmu 0.09; kappa 0.4;")
+        (c / "0/omega").write_text(txt.replace("omegaWallFunction;", "omegaWallFunction; beta1 0.08; n 4;"))
+        with self.assertRaises(UnsupportedCase) as e:
+            check_case(c, "0")
+        msg = str(e.exception)
+        self.assertIn("0/nut patch sphere (nutkWallFunction) uses blending binomial; the solver implements "
+                      "blending stepwise", msg)
+        self.assertIn("0/nut patch sphere (nutkWallFunction) sets kappa 0.4; the solver implements kappa 0.41", msg)
+        self.assertIn("0/omega patch sphere (omegaWallFunction) sets beta1 0.08", msg)
+        self.assertIn("0/omega patch sphere (omegaWallFunction) uses blending binomial n 4; the solver implements "
+                      "blending binomial n 2", msg)
 
     def test_missing_entries_and_files_listed(self):
         c = self.case_with_fields("sphere-kOmegaSST")
@@ -118,8 +151,7 @@ boundaryField
         with mock.patch.dict(os.environ, NO_ETC):
             check_case(c, "0")      # U symmetryPlane comes from setConstraintTypes; p lists farfield explicitly
             self.edit(c / "0/p", "farfield { type zeroGradient; }", '#includeEtc "caseDicts/setConstraintTypes"')
-            with self.assertRaisesRegex(UnsupportedCase, "0/p uses boundary type symmetryPlane on patch farfield"):
-                check_case(c, "0")
+            check_case(c, "0")      # p symmetryPlane from setConstraintTypes: zero gradient for a scalar
             self.edit(c / "0/U", "$flowVelocity", "$flowSpeed")
             with self.assertRaisesRegex(UnsupportedCase, r"\$flowSpeed is not defined"):
                 check_case(c, "0")
@@ -157,6 +189,60 @@ boundaryField
         self.assertNotIn("'off'", text)
         self.assertEqual(len(warnings), 3)
 
+    def test_force_patches(self):
+        """forceCoeffs patches are names, patch groups or regular expressions, as in OpenFOAM."""
+        patches = [dict(name="inlet", groups=[]), dict(name="lowerWall", groups=["wall"]),
+                   dict(name="motorBike_frt-fairing:001%1", groups=["motorBikeGroup", "wall"]),
+                   dict(name="motorBike_windshield:002%2", groups=["motorBikeGroup", "wall"])]
+        bike = ["motorBike_frt-fairing:001%1", "motorBike_windshield:002%2"]
+        self.assertEqual(force_patches(["motorBikeGroup"], patches), bike)
+        self.assertEqual(force_patches(["motorBike.*"], patches), bike)
+        self.assertEqual(force_patches(["motorBike_windshield:002%2"], patches), bike[1:])
+        self.assertEqual(force_patches(["wall"], patches), ["lowerWall"] + bike)
+        self.assertEqual(force_patches(["motor.*Group"], patches), bike)
+        self.assertEqual(force_patches(["inlet", "lowerWall"], patches), ["inlet", "lowerWall"])
+        self.assertEqual(force_patches(["sphere", "("], patches), [])
+
+    def force_case(self, patches):
+        c = self.case("sphere-laminar")
+        cd = c / "system/controlDict"
+        txt = cd.read_text()
+        cd.write_text(txt[:txt.index("functions")] + """functions
+{
+    forceCoeffs1
+    {
+        type forceCoeffs; libs (forces); patches %s; rho rhoInf; rhoInf 1;
+        liftDir (0 0 1); dragDir (1 0 0); CofR (0 0 0); pitchAxis (0 1 0); magUInf 1; lRef 1; Aref 1;
+    }
+}
+""" % patches)
+        (c / "constant/polyMesh/boundary").write_text(
+            """FoamFile { version 2.0; format ascii; class polyBoundaryMesh; object boundary; }
+2 ( inlet { type patch; nFaces 1; startFace 0; }
+    sphere { type wall; inGroups 2(bodyGroup wall); nFaces 1; startFace 1; } )
+""")
+        return c
+
+    def test_force_coeffs_on_a_patch_group(self):
+        c = self.force_case("(bodyGroup)")
+        from simplefoam_gpu import foamio
+        force, warnings = function_objects(c, rans=False,
+                                           patches=foamio.read_boundary(c / "constant/polyMesh/boundary"))
+        self.assertEqual(force[0], "forceCoeffs1")
+        self.assertEqual(warnings, [])
+
+    def test_force_coeffs_matching_nothing_is_reported(self):
+        """A forceCoeffs whose patches select nothing would write zero forces; it is reported and not run."""
+        c = self.force_case("(motorBikeGroup)")
+        from simplefoam_gpu import foamio
+        force, warnings = function_objects(c, rans=False,
+                                           patches=foamio.read_boundary(c / "constant/polyMesh/boundary"))
+        self.assertIsNone(force)
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("patches (motorBikeGroup) match no patch or patch group", warnings[0])
+        status, out = self.run_check_command(c)
+        self.assertIn("match no patch or patch group", out)
+
     def run_check_command(self, *args):
         out = io.StringIO()
         with redirect_stdout(out), mock.patch.dict(os.environ, NO_ETC):
@@ -170,11 +256,11 @@ boundaryField
         self.assertIn("simplefoam-gpu can run this case.", out)
 
         c = self.case_with_fields("sphere-kOmegaSST")
-        self.edit(c / "0/nut", "sphere   { type nutUSpaldingWallFunction;", "sphere   { type nutkWallFunction;")
+        self.edit(c / "0/nut", "sphere   { type nutUSpaldingWallFunction;", "sphere   { type nutkRoughWallFunction;")
         self.edit(c / "system/controlDict", "    yPlus\n", "    streamLines { type streamLine; }\n    yPlus\n")
         status, out = self.run_check_command(c)
         self.assertEqual(status, 1)
-        self.assertIn("0/nut uses boundary type nutkWallFunction on patch sphere", out)
+        self.assertIn("0/nut uses boundary type nutkRoughWallFunction on patch sphere", out)
         self.assertIn("'streamLines' (type streamLine) is not supported", out)
         self.assertNotIn("can run this case", out)
 

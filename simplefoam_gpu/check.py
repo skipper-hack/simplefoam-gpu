@@ -22,16 +22,21 @@ TURBULENCE_SCHEMES = {
 SUPPORTED_PATCHES = {"patch", "wall", "symmetry", "symmetryPlane"}
 
 # Boundary condition types the solver implements per field, with the entries each one reads.
+# For scalars, slip, symmetry and symmetryPlane are zero-gradient conditions, as in OpenFOAM.
+_SYMMETRY = {"slip": (), "symmetry": (), "symmetryPlane": ()}
 _SCALAR_BCS = {"fixedValue": ("value",), "inletOutlet": ("inletValue",), "omegaWallFunction": ("value",),
-               "zeroGradient": (), "kqRWallFunction": ()}
+               "zeroGradient": (), "kqRWallFunction": (), **_SYMMETRY}
 FIELD_BCS = {
     "U": {"fixedValue": ("value",), "noSlip": (), "movingWallVelocity": ("value",), "slip": (), "symmetry": (),
           "symmetryPlane": (), "zeroGradient": (), "pressureInletOutletVelocity": (), "inletOutlet": ("inletValue",)},
-    "p": {"fixedValue": ("value",), "zeroGradient": ()},
+    "p": {"fixedValue": ("value",), "zeroGradient": (), **_SYMMETRY},
     "k": _SCALAR_BCS,
     "omega": _SCALAR_BCS,
-    "nut": {"nutUSpaldingWallFunction": (), "calculated": ()},
+    "nut": {"nutUSpaldingWallFunction": (), "nutkWallFunction": (), "calculated": (), **_SYMMETRY},
 }
+# Wall-function settings the solver implements (OpenFOAM v2412's defaults); other values are refused.
+WALL_FUNCTION_COEFFS = {"Cmu": 0.09, "kappa": 0.41, "E": 9.8, "beta1": 0.075}
+WALL_FUNCTION_BLENDING = {"nutkWallFunction": ("stepwise", None), "omegaWallFunction": ("binomial", 2.0)}
 
 
 class UnsupportedCase(Exception):
@@ -178,6 +183,19 @@ def _check_field(case, start, name, patches, problems):
         for key in allowed[t]:
             if key not in e:
                 problems.append(f"{rel} patch {p['name']} ({t}) has no {key}")
+        if t.endswith("WallFunction"):
+            for key, default in WALL_FUNCTION_COEFFS.items():
+                if key in e and not (_is_number(e[key][0]) and float(e[key][0]) == default):
+                    problems.append(f"{rel} patch {p['name']} ({t}) sets {key} {_text(e[key])}; "
+                                    f"the solver implements {key} {default}")
+            want, n = WALL_FUNCTION_BLENDING.get(t, (None, None))
+            got = str(e.get("blending", [want])[0])
+            got_n = e.get("n", [n])[0]
+            if want and (got != want or (n is not None and not (_is_number(got_n) and float(got_n) == n))):
+                shown_n = e["n"][0] if "n" in e else (f"{n:g}" if n is not None else None)
+                problems.append(f"{rel} patch {p['name']} ({t}) uses blending {got}"
+                                + (f" n {shown_n}" if got == "binomial" and shown_n is not None else "")
+                                + f"; the solver implements blending {want}" + (f" n {n:g}" if n else ""))
         for key in ("value", "inletValue"):
             if key in e and not _readable(e[key], p["nFaces"], nc):
                 problems.append(f"{rel} patch {p['name']} {key} '{_text(e[key])}' is not a value the solver can read")
@@ -189,9 +207,20 @@ def _check_field(case, start, name, patches, problems):
 FORCE_COEFFS_KEYS = ("patches", "dragDir", "liftDir", "pitchAxis", "rhoInf", "magUInf", "Aref", "lRef")
 
 
-def function_objects(case, rans):
+def force_patches(patterns, patches):
+    """The names of the patches a forceCoeffs 'patches' list selects. As in OpenFOAM, each entry is a patch name,
+    a patch group (e.g. motorBikeGroup) or a regular expression, matched against patch names and group names."""
+    def hit(x, key):
+        return x == key or _is_regex_match(x, key)
+    return [p["name"] for p in patches
+            if any(hit(x, key) for x in patterns for key in [p["name"], *p.get("groups", [])])]
+
+
+def function_objects(case, rans, patches=None):
     """controlDict functions: the forceCoeffs entry the solver will run as (name, dict) or None, and a warning
-    for every function object it will not run (it runs one forceCoeffs, and yPlus in turbulent cases)."""
+    for every function object it will not run (it runs one forceCoeffs, and yPlus in turbulent cases).
+    patches: the mesh's patches (from foamio.read_boundary); when given, a forceCoeffs whose patches select
+    none of them is reported and not run, instead of writing zero forces."""
     fn = foamio.read_dict(Path(case) / "system/controlDict").get("functions", {})
     force, warnings = None, []
     if not isinstance(fn, dict):
@@ -219,6 +248,9 @@ def function_objects(case, rans):
         elif any(k not in d for k in FORCE_COEFFS_KEYS):
             need = ", ".join(k for k in FORCE_COEFFS_KEYS if k not in d)
             warnings.append(f"forceCoeffs '{name}' has no {need}; it will not run{why}")
+        elif patches is not None and not force_patches(_words(d["patches"]), patches):
+            warnings.append(f"forceCoeffs '{name}': patches ({' '.join(_words(d['patches']))}) match no patch or "
+                            "patch group in the mesh; it will not run")
         else:
             force = (name, d)
     return force, warnings
@@ -250,6 +282,11 @@ def _tokens(v):
         else:
             out.append(x)
     return out
+
+
+def _words(v):
+    """The words of a (possibly nested) list value, without the brackets."""
+    return [str(x) for x in _tokens(v) if x not in ("(", ")")]
 
 
 def _names(names):
@@ -315,7 +352,9 @@ def main(argv=None):
         print("\n" + msg[:1].upper() + msg[1:])
     try:
         tp = foamio.read_dict(case / "constant/turbulenceProperties")
-        _, warnings = function_objects(case, tp.get("simulationType", ["laminar"])[0] == "RAS")
+        boundary = case / "constant/polyMesh/boundary"
+        patches = foamio.read_boundary(boundary) if boundary.is_file() else None
+        _, warnings = function_objects(case, tp.get("simulationType", ["laminar"])[0] == "RAS", patches)
     except (OSError, foamio.FoamSyntaxError):
         warnings = []   # reported above
     if warnings:

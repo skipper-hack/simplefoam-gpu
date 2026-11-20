@@ -17,7 +17,7 @@ from .mesh import Mesh
 from .amg import AMG, bicgstab
 from . import kernels
 from . import fused
-from .check import check_case, function_objects, UnsupportedCase
+from .check import check_case, force_patches, function_objects, UnsupportedCase
 
 
 REFERENCE = os.environ.get("SIMPLEFOAM_GPU_REFERENCE") == "1"   # use the plain array code instead of fused kernels
@@ -70,18 +70,17 @@ class Solver:
     def _read_forces(self, rans):
         """Set up the forceCoeffs function object, and warn about every function object that will not run."""
         self.forces = None
-        force, warnings = function_objects(self.case, rans)
+        force, warnings = function_objects(self.case, rans, self.m.patches)
         for w in warnings:
             self.log(f"warning: {w}")
         if force is None:
             return
         fname, d = force
-        import re
         try:
-            pats = [p for p in foamio_flat(d["patches"])]
+            chosen = set(force_patches(foamio_flat(d["patches"]), self.m.patches))
             mask = cp.zeros(self.m.nb, bool)
             for p in self.m.patches:
-                if any(re.fullmatch(x, p["name"]) for x in pats):
+                if p["name"] in chosen:
                     mask[p["sl"]] = True
             drag = foamio.vector(d["dragDir"]); lift = foamio.vector(d["liftDir"])
             pitch = foamio.vector(d["pitchAxis"])
@@ -92,7 +91,7 @@ class Solver:
                                side=cp.asarray(np.cross(lift, drag)),
                                Uinf=foamio.scalar(d["magUInf"]), Aref=foamio.scalar(d["Aref"]),
                                lRef=foamio.scalar(d["lRef"]), name=fname)
-        except (ValueError, TypeError, IndexError, re.error) as e:
+        except (ValueError, TypeError, IndexError) as e:
             self.forces = None
             self.log(f"warning: forceCoeffs '{fname}' settings could not be read ({e}); it will not run")
 
@@ -133,7 +132,7 @@ class Solver:
             if t == "fixedValue":
                 self.p_fixed[sl] = 1.0
                 self.p_ref[sl] = cp.asarray(foamio.expand(e["value"], n, 1))
-            elif t != "zeroGradient":
+            elif t not in ("zeroGradient", "slip", "symmetry", "symmetryPlane"):   # as zeroGradient for scalars
                 raise NotImplementedError(f"p boundary type {t}")
         phi_file = self.case / start / "phi"
         if phi_file.exists():
